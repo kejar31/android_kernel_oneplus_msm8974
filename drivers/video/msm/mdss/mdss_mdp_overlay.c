@@ -358,6 +358,7 @@ int mdss_mdp_overlay_pipe_setup(struct msm_fb_data_type *mfd,
 	struct mdp_histogram_start_req hist;
 	int ret;
 	u32 bwc_enabled;
+	u32 rot90;
 
 	if (mdp5_data->ctl == NULL)
 		return -ENODEV;
@@ -381,14 +382,27 @@ int mdss_mdp_overlay_pipe_setup(struct msm_fb_data_type *mfd,
 	pr_debug("pipe ctl=%u req id=%x mux=%d\n", mdp5_data->ctl->num, req->id,
 			mixer_mux);
 
-	if (req->flags & (MDP_SOURCE_ROTATED_90 | MDP_BWC_EN))
-		req->src.format =
-			mdss_mdp_get_rotator_dst_format(req->src.format, 1);
-
 	fmt = mdss_mdp_get_format_params(req->src.format);
 	if (!fmt) {
 		pr_err("invalid pipe format %d\n", req->src.format);
 		return -EINVAL;
+	}
+
+	bwc_enabled = req->flags & MDP_BWC_EN;
+	rot90 = req->flags & MDP_SOURCE_ROTATED_90;
+
+	/*
+	 * Always set yuv rotator output to pseudo planar.
+	 */
+	if (bwc_enabled || rot90) {
+		req->src.format =
+			mdss_mdp_get_rotator_dst_format(req->src.format, rot90,
+				bwc_enabled);
+		fmt = mdss_mdp_get_format_params(req->src.format);
+		if (!fmt) {
+			pr_err("invalid pipe format %d\n", req->src.format);
+			return -EINVAL;
+		}
 	}
 
 	ret = mdss_mdp_overlay_req_check(mfd, req, fmt);
@@ -467,7 +481,6 @@ int mdss_mdp_overlay_pipe_setup(struct msm_fb_data_type *mfd,
 	}
 
 	pipe->flags = req->flags;
-	bwc_enabled = req->flags & MDP_BWC_EN;
 	if (bwc_enabled  &&  !mdp5_data->mdata->has_bwc) {
 		pr_err("BWC is not supported in MDP version %x\n",
 			mdp5_data->mdata->mdp_rev);
@@ -1284,8 +1297,8 @@ static int __mdss_mdp_overlay_release_all(struct msm_fb_data_type *mfd,
 		}
 	}
 
-	if (cnt == 0 && !list_empty(&mdp5_data->pipes_cleanup)) {
-		pr_debug("overlay release on fb%d called without commit!",
+	if (!mfd->ref_cnt && !list_empty(&mdp5_data->pipes_cleanup)) {
+		pr_debug("fb%d:: free pipes present in cleanup list",
 			mfd->index);
 		cnt++;
 	}
@@ -1718,10 +1731,12 @@ static ssize_t dynamic_fps_sysfs_rda_dfps(struct device *dev,
 		return -ENODEV;
 	}
 
+	mutex_lock(&mdp5_data->dfps_lock);
 	ret = snprintf(buf, PAGE_SIZE, "%d\n",
 		       pdata->panel_info.mipi.frame_rate);
 	pr_debug("%s: '%d'\n", __func__,
 		pdata->panel_info.mipi.frame_rate);
+	mutex_unlock(&mdp5_data->dfps_lock);
 
 	return ret;
 } /* dynamic_fps_sysfs_rda_dfps */
@@ -1756,6 +1771,7 @@ static ssize_t dynamic_fps_sysfs_wta_dfps(struct device *dev,
 		return count;
 	}
 
+	mutex_lock(&mdp5_data->dfps_lock);
 	if (dfps < 30) {
 		pr_err("Unsupported FPS. Configuring to min_fps = 30\n");
 		dfps = 30;
@@ -1772,9 +1788,11 @@ static ssize_t dynamic_fps_sysfs_wta_dfps(struct device *dev,
 	} else {
 		pr_err("Failed to configure '%d' FPS. rc = %d\n",
 							dfps, rc);
+		mutex_unlock(&mdp5_data->dfps_lock);
 		return rc;
 	}
 	pdata->panel_info.new_fps = dfps;
+	mutex_unlock(&mdp5_data->dfps_lock);
 	return count;
 } /* dynamic_fps_sysfs_wta_dfps */
 
@@ -2695,6 +2713,8 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 	if (!mdp5_data->ctl->power_on)
 		return 0;
 
+	mutex_lock(&mdp5_data->ov_lock);
+
 	mdss_mdp_overlay_free_fb_pipe(mfd);
 
 	mixer = mdss_mdp_mixer_get(mdp5_data->ctl, MDSS_MDP_MIXER_MUX_LEFT);
@@ -2708,15 +2728,19 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 	mutex_lock(&mdp5_data->list_lock);
 	need_cleanup = !list_empty(&mdp5_data->pipes_cleanup);
 	mutex_unlock(&mdp5_data->list_lock);
+	mutex_unlock(&mdp5_data->ov_lock);
 
 	if (need_cleanup) {
 		pr_debug("cleaning up pipes on fb%d\n", mfd->index);
 		mdss_mdp_overlay_kickoff(mfd, NULL);
 	}
 
+	mutex_lock(&mdp5_data->ov_lock);
 	rc = mdss_mdp_ctl_stop(mdp5_data->ctl);
 	if (rc == 0) {
+		mutex_lock(&mdp5_data->list_lock);
 		__mdss_mdp_overlay_free_list_purge(mfd);
+		mutex_unlock(&mdp5_data->list_lock);
 		mdss_mdp_ctl_notifier_unregister(mdp5_data->ctl,
 				&mfd->mdp_sync_pt_data.notifier);
 
@@ -2733,6 +2757,7 @@ static int mdss_mdp_overlay_off(struct msm_fb_data_type *mfd)
 		if (rc)
 			pr_err("unable to suspend w/pm_runtime_put (%d)\n", rc);
 	}
+	mutex_unlock(&mdp5_data->ov_lock);
 
 	return rc;
 }
@@ -3006,6 +3031,7 @@ int mdss_mdp_overlay_init(struct msm_fb_data_type *mfd)
 	INIT_LIST_HEAD(&mdp5_data->rot_proc_list);
 	mutex_init(&mdp5_data->list_lock);
 	mutex_init(&mdp5_data->ov_lock);
+	mutex_init(&mdp5_data->dfps_lock);
 	mdp5_data->hw_refresh = true;
 	mdp5_data->overlay_play_enable = true;
 

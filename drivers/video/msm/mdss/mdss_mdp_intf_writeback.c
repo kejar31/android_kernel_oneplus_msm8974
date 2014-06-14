@@ -20,6 +20,12 @@
 #define VBIF_WR_LIM_CONF    0xC0
 #define MDSS_DEFAULT_OT_SETTING    0x10
 
+/*
+ * if BWC enabled and format is H1V2 or 420, do not use site C or I.
+ * Hence, set the bits 29:26 in format register, as zero.
+ */
+#define BWC_FMT_MASK	0xC3FFFFFF
+
 enum mdss_mdp_writeback_type {
 	MDSS_MDP_WRITEBACK_TYPE_ROTATOR,
 	MDSS_MDP_WRITEBACK_TYPE_LINE,
@@ -184,6 +190,8 @@ static int mdss_mdp_writeback_format_setup(struct mdss_mdp_writeback_ctx *ctx,
 		     (fmt->bits[C1_B_Cb] << 2) |
 		     (fmt->bits[C0_G_Y] << 0);
 
+	dst_format &= BWC_FMT_MASK;
+
 	if (fmt->bits[C3_ALPHA] || fmt->alpha_enable) {
 		dst_format |= BIT(8); /* DSTC3_EN */
 		if (!fmt->alpha_enable)
@@ -214,6 +222,7 @@ static int mdss_mdp_writeback_format_setup(struct mdss_mdp_writeback_ctx *ctx,
 		   (ctx->dst_planes.ystride[3] << 16);
 	outsize = (ctx->dst_rect.h << 16) | ctx->dst_rect.w;
 
+	mdp_wb_write(ctx, MDSS_MDP_REG_WB_ALPHA_X_VALUE, 0xFF);
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_FORMAT, dst_format);
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_OP_MODE, opmode);
 	mdp_wb_write(ctx, MDSS_MDP_REG_WB_DST_PACK_PATTERN, pattern);
@@ -262,6 +271,7 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 	struct mdss_mdp_writeback_ctx *ctx;
 	struct mdss_mdp_writeback_arg *wb_args;
 	struct mdss_mdp_rotator_session *rot;
+	struct mdss_mdp_format_params *fmt;
 	u32 format;
 
 	ctx = (struct mdss_mdp_writeback_ctx *) ctl->priv_data;
@@ -294,10 +304,17 @@ static int mdss_mdp_writeback_prepare_rot(struct mdss_mdp_ctl *ctl, void *arg)
 
 	ctx->rot90 = !!(rot->flags & MDP_ROT_90);
 
+	fmt = mdss_mdp_get_format_params(rot->format);
+	if (!fmt) {
+		pr_err("invalid pipe format %d\n", rot->format);
+		return -EINVAL;
+	}
+
 	if (ctx->bwc_mode || ctx->rot90)
-		format = mdss_mdp_get_rotator_dst_format(rot->format, 1);
+		format = mdss_mdp_get_rotator_dst_format(rot->format,
+				ctx->rot90, ctx->bwc_mode);
 	else
-		format = mdss_mdp_get_rotator_dst_format(rot->format, 0);
+		format = rot->format;
 
 	if (ctx->rot90) {
 		ctx->opmode |= BIT(5); /* ROT 90 */
@@ -552,8 +569,6 @@ int mdss_mdp_writeback_start(struct mdss_mdp_ctl *ctl)
 
 int mdss_mdp_writeback_display_commit(struct mdss_mdp_ctl *ctl, void *arg)
 {
-	int ret = 0;
-
 	if (ctl->shared_lock && !mutex_is_locked(ctl->shared_lock)) {
 		pr_err("shared mutex is not locked before commit on ctl=%d\n",
 			ctl->num);
@@ -567,10 +582,5 @@ int mdss_mdp_writeback_display_commit(struct mdss_mdp_ctl *ctl, void *arg)
 			ctl->mixer_right->params_changed++;
 	}
 
-	ret = mdss_mdp_display_commit(ctl, arg);
-
-	if (!IS_ERR_VALUE(ret))
-		mdss_mdp_display_wait4comp(ctl);
-
-	return ret;
+	return mdss_mdp_display_commit(ctl, arg);
 }

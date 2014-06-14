@@ -23,6 +23,7 @@
 #include "mdss_fb.h"
 #include "mdss_mdp.h"
 #include "mdss_debug.h"
+#include "mdss_mdp_trace.h"
 
 static void mdss_mdp_xlog_mixer_reg(struct mdss_mdp_ctl *ctl);
 static inline u64 fudge_factor(u64 val, u32 numer, u32 denom)
@@ -338,8 +339,13 @@ int mdss_mdp_perf_calc_pipe(struct mdss_mdp_pipe *pipe,
 		struct mdss_panel_info *pinfo;
 
 		pinfo = &mixer->ctl->panel_data->panel_info;
-		fps = mdss_panel_get_framerate(pinfo);
-		v_total = mdss_panel_get_vtotal(pinfo);
+		if (pinfo->type == MIPI_VIDEO_PANEL) {
+			fps = pinfo->panel_max_fps;
+			v_total = pinfo->panel_max_vtotal;
+		} else {
+			fps = mdss_panel_get_framerate(pinfo);
+			v_total = mdss_panel_get_vtotal(pinfo);
+		}
 		xres = pinfo->xres;
 		is_fbc = pinfo->fbc.enabled;
 	} else {
@@ -459,8 +465,13 @@ static void mdss_mdp_perf_calc_mixer(struct mdss_mdp_mixer *mixer,
 	if (!mixer->rotator_mode) {
 		if (mixer->type == MDSS_MDP_MIXER_TYPE_INTF) {
 			pinfo = &mixer->ctl->panel_data->panel_info;
-			fps = mdss_panel_get_framerate(pinfo);
-			v_total = mdss_panel_get_vtotal(pinfo);
+			if (pinfo->type == MIPI_VIDEO_PANEL) {
+				fps = pinfo->panel_max_fps;
+				v_total = pinfo->panel_max_vtotal;
+			} else {
+				fps = mdss_panel_get_framerate(pinfo);
+				v_total = mdss_panel_get_vtotal(pinfo);
+			}
 
 			if (pinfo->type == WRITEBACK_PANEL)
 				pinfo = NULL;
@@ -833,6 +844,7 @@ static inline void mdss_mdp_ctl_perf_update_bus(struct mdss_mdp_ctl *ctl)
 	bus_ib_quota = bw_sum_of_intfs;
 	bus_ab_quota = apply_fudge_factor(bw_sum_of_intfs,
 		&mdss_res->ab_factor);
+	trace_mdp_perf_update_bus(bus_ab_quota, bus_ib_quota);
 	mdss_mdp_bus_scale_set_quota(bus_ab_quota, bus_ib_quota);
 	pr_debug("ab=%llu ib=%llu\n", bus_ab_quota, bus_ib_quota);
 }
@@ -874,6 +886,7 @@ void mdss_mdp_ctl_perf_release_bw(struct mdss_mdp_ctl *ctl)
 
 	/*Release the bandwidth only if there are no transactions pending*/
 	if (!transaction_status) {
+		trace_mdp_cmd_release_bw(ctl->num);
 		ctl->cur_perf.bw_ctl = 0;
 		ctl->new_perf.bw_ctl = 0;
 		pr_debug("Release BW ctl=%d\n", ctl->num);
@@ -1966,6 +1979,7 @@ static int mdss_mdp_mixer_setup(struct mdss_mdp_ctl *ctl,
 	if (!mixer)
 		return -ENODEV;
 
+	trace_mdp_mixer_update(mixer->num);
 	pr_debug("setup mixer=%d\n", mixer->num);
 
 	outsize = (mixer->roi.h << 16) | mixer->roi.w;
@@ -2070,6 +2084,8 @@ static int mdss_mdp_mixer_setup(struct mdss_mdp_ctl *ctl,
 			blend_color_out = 0;
 
 		mixercfg |= stage << (3 * pipe->num);
+
+		trace_mdp_sspp_change(pipe);
 
 		pr_debug("stg=%d op=%x fg_alpha=%x bg_alpha=%x\n", stage,
 					blend_op, fg_alpha, bg_alpha);
@@ -2482,6 +2498,8 @@ int mdss_mdp_display_wait4comp(struct mdss_mdp_ctl *ctl)
 
 	if (ctl->wait_fnc)
 		ret = ctl->wait_fnc(ctl, NULL);
+
+	trace_mdp_commit(ctl);
 
 	mdss_mdp_ctl_perf_update(ctl, 0);
 
