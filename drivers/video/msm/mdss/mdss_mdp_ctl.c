@@ -23,7 +23,7 @@
 #include "mdss_fb.h"
 #include "mdss_mdp.h"
 #include "mdss_debug.h"
-#include "mdss_mdp_trace.h"
+#include <trace/mdss_mdp_trace.h>
 
 static void mdss_mdp_xlog_mixer_reg(struct mdss_mdp_ctl *ctl);
 static inline u64 fudge_factor(u64 val, u32 numer, u32 denom)
@@ -488,6 +488,14 @@ static void mdss_mdp_perf_calc_mixer(struct mdss_mdp_mixer *mixer,
 				fps * mixer->width * mixer->height * 3;
 	}
 
+	/*
+	 * In case of border color, we still need enough mdp clock
+	 * to avoid under-run. Clock requirement for border color is
+	 * based on mixer width.
+	 */
+	if (num_pipes == 0)
+		goto exit;
+
 	memset(bw_overlap, 0, sizeof(u64) * MDSS_MDP_MAX_STAGE);
 	memset(v_region, 0, sizeof(u32) * MDSS_MDP_MAX_STAGE * 2);
 
@@ -567,10 +575,10 @@ static void mdss_mdp_perf_calc_mixer(struct mdss_mdp_mixer *mixer,
 	if (max_clk_rate > perf->mdp_clk_rate)
 		perf->mdp_clk_rate = max_clk_rate;
 
+exit:
 	pr_debug("final mixer=%d video=%d clk_rate=%u bw=%llu prefill=%d\n",
 		mixer->num, mixer->ctl->is_video_mode, perf->mdp_clk_rate,
 		perf->bw_overlap, perf->prefill_bytes);
-
 }
 
 static u32 mdss_mdp_get_vbp_factor(struct mdss_mdp_ctl *ctl)
@@ -623,7 +631,7 @@ static void __mdss_mdp_perf_calc_ctl_helper(struct mdss_mdp_ctl *ctl,
 
 	memset(perf, 0, sizeof(*perf));
 
-	if (left_cnt && ctl->mixer_left) {
+	if (ctl->mixer_left) {
 		mdss_mdp_perf_calc_mixer(ctl->mixer_left, &tmp,
 				left_plist, left_cnt);
 		perf->bw_overlap += tmp.bw_overlap;
@@ -631,7 +639,7 @@ static void __mdss_mdp_perf_calc_ctl_helper(struct mdss_mdp_ctl *ctl,
 		perf->mdp_clk_rate = tmp.mdp_clk_rate;
 	}
 
-	if (right_cnt && ctl->mixer_right) {
+	if (ctl->mixer_right) {
 		mdss_mdp_perf_calc_mixer(ctl->mixer_right, &tmp,
 				right_plist, right_cnt);
 		perf->bw_overlap += tmp.bw_overlap;
@@ -805,6 +813,17 @@ u32 mdss_mdp_ctl_perf_get_transaction_status(struct mdss_mdp_ctl *ctl)
 	unsigned long flags;
 	u32 transaction_status;
 
+	if (!ctl)
+		return PERF_STATUS_BUSY;
+
+	/*
+	 * If Rotator mode and bandwidth has been released; return STATUS_DONE
+	 * so the bandwidth is re-calculated.
+	 */
+	if (ctl->mixer_left && ctl->mixer_left->rotator_mode &&
+		!ctl->perf_release_ctl_bw)
+			return PERF_STATUS_DONE;
+
 	/*
 	 * If Video Mode or not valid data to determine the status, return busy
 	 * status, so the bandwidth cannot be freed by the caller
@@ -919,6 +938,14 @@ static int mdss_mdp_select_clk_lvl(struct mdss_mdp_ctl *ctl,
 	return clk_rate;
 }
 
+static void mdss_mdp_perf_release_ctl_bw(struct mdss_mdp_ctl *ctl,
+	struct mdss_mdp_perf_params *perf)
+{
+	/* Set to zero controller bandwidth. */
+	memset(perf, 0, sizeof(*perf));
+	ctl->perf_release_ctl_bw = false;
+}
+
 static void mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl,
 		int params_changed)
 {
@@ -943,7 +970,9 @@ static void mdss_mdp_ctl_perf_update(struct mdss_mdp_ctl *ctl,
 	is_bw_released = !mdss_mdp_ctl_perf_get_transaction_status(ctl);
 
 	if (ctl->power_on) {
-		if (is_bw_released || params_changed)
+		if (ctl->perf_release_ctl_bw)
+			mdss_mdp_perf_release_ctl_bw(ctl, new);
+		else if (is_bw_released || params_changed)
 			mdss_mdp_perf_calc_ctl(ctl, new);
 		/*
 		 * if params have just changed delay the update until
@@ -1471,6 +1500,7 @@ struct mdss_mdp_ctl *mdss_mdp_ctl_init(struct mdss_panel_data *pdata,
 	ctl->mfd = mfd;
 	ctl->panel_data = pdata;
 	ctl->is_video_mode = false;
+	ctl->perf_release_ctl_bw = false;
 
 	switch (pdata->panel_info.type) {
 	case EDP_PANEL:
