@@ -23,6 +23,7 @@
 #include "mdss_mdp.h"
 #include "mdss_mdp_rotator.h"
 #include "mdss_fb.h"
+#include "mdss_debug.h"
 
 #define MAX_ROTATOR_SESSIONS 8
 
@@ -281,8 +282,9 @@ static int mdss_mdp_rotator_queue_sub(struct mdss_mdp_rotator_session *rot,
 		pr_err("unable to queue rot data\n");
 		goto error;
 	}
-
+	ATRACE_BEGIN("rotator_kickoff");
 	ret = mdss_mdp_rotator_kickoff(rot_ctl, rot, dst_data);
+	ATRACE_END("rotator_kickoff");
 
 	return ret;
 error:
@@ -533,6 +535,14 @@ int mdss_mdp_rotator_setup(struct msm_fb_data_type *mfd,
 		if (rot && (req->id == MSMFB_NEW_REQUEST))
 			mdss_mdp_rotator_finish(rot);
 	}
+	/*
+	 * overwrite the src format for rotator to dst format
+	 * for use by the user. On subsequent set calls, the
+	 * user is expected to proivde the original src format
+	 */
+	req->src.format = mdss_mdp_get_rotator_dst_format(req->src.format,
+		req->flags & MDP_ROT_90, req->flags & MDP_BWC_EN);
+
 	mutex_unlock(&rotator_lock);
 	return ret;
 }
